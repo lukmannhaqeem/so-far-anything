@@ -1,0 +1,380 @@
+---
+title: Identifying key species habitats and corridors
+author: Lukmann Haqeem
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+bibliography: scholar.bib
+header-includes:
+    \usepackage{float}
+output:
+     pdf_document: default
+     html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+\
+\
+
+## Getting started
+
+```{r packages, warning = FALSE, message = FALSE}
+# Load packages
+library(unmarked)
+library(jagsUI)
+library(raster)
+library(gdistance)
+library(cluster)
+library(factoextra)
+
+# Load data sets
+#load sample data
+set.seed(1234)
+dat <- read.csv(file.choose(), comment = "#")
+head(dat)
+dim(dat)
+#load study area (for predictions part later)
+data(Switzerland)
+head(Switzerland)
+dim(Switzerland)
+
+# Plot data sets
+#study area
+raster <- rasterFromXYZ(data.frame(x = Switzerland$x,
+								   y = Switzerland$y,
+								   z = Switzerland$elevation))
+mapPalette <- colorRampPalette(c("grey88", "grey66", "grey44", "grey22"))
+plot(raster, col = mapPalette(100), main = "Location of sampling points")
+#sampling points
+points(dat$easting, dat$northing, pch = 0, cex = 1, col = "red") 
+
+# Perform EDA
+#extract the count data
+C <- as.matrix(dat[,3:5])
+#check initial patterns or anomalies
+head(C)
+Cmax <- apply(C, 1, max, na.rm = TRUE)
+min(Cmax)
+max(Cmax)
+nSites <- nrow(C)
+nOcc <- rowSums(!is.na(C))
+```
+\
+
+## Statistical modeling
+
+```{r jags, warning = FALSE, message = FALSE}
+# Run Bayesian N-mixture model 
+#construct JAGS building block for state-space model
+modelText <- "
+model{
+for(i in 1:nSites){
+    # Likelihood
+    log(lambda[i]) <- b0 +
+                      bForest * forest[i] +
+                      bForest2 * forest2[i] +
+                      bElevation * elevation[i] +
+                      bElevation2 * elevation2[i]                     
+    # Ecological process
+    N[i] ~ dpois(lambda[i]) 
+    
+    for (j in 1:nOcc[i]){
+        # Observation process
+        C[i,j] ~ dbin(p, N[i]) 
+    }
+}
+    # Priors
+    b0 ~ dunif(-10, 10)          
+    bForest ~ dunif(-5, 5)       
+    bForest2 ~ dunif(-5, 5)      
+    bElevation ~ dunif(-5, 5)    
+    bElevation2 ~ dunif(-5, 5)   
+    p ~ dunif(0, 1)
+}
+ "
+writeLines(modelText, "model1.jags")
+#organise data sets for the model 
+jagsData <- list(nSites = nrow(C),
+                 nOcc = nOcc,
+                 C = C,
+                 forest = dat$forest,
+                 forest2 = dat$forest^2,
+                 elevation = dat$elevation,
+                 elevation2 = dat$elevation^2)
+str(jagsData)             
+#set parameters to monitor 
+monitor <- c("b0", "bForest", "bForest2", "bElevation", "bElevation2")
+#set initial values for parameters
+init <- function() list(N = Cmax, z = rep(1, nrow(C)))
+
+#mcmc settings
+nc <- 3
+ni <- 30000
+nb <- ni/2
+na <- 1000
+
+#run the model
+system.time(
+    sim1 <- jags(data = jagsData,
+                 inits = init,
+                 parameters.to.save = monitor,
+                 model.file = "model1.jags", 
+                 n.chains = nc,
+                 n.iter = ni,
+                 n.burn = nb, 
+                 n.adapt = na,
+                 parallel = TRUE,
+                 DIC = FALSE)
+) # 22 s
+#check for chains convergence               
+mean(unlist(sim1$Rhat) > 1.1)
+```
+\
+
+## Making prediction
+
+```{r predict, eval = FALSE, warning = FALSE, message = FALSE}
+# Using the model for making predictions across the entire study area (~SDM)
+#estimate 1000 abundance estimates for the entire study area  
+tmp <- matrix(NA, nrow = n, ncol = nrow(Switzerland))
+n <- 1000
+ord <- sample(1:length(sim1$sims.list$b0), n, replace = FALSE)
+system.time(
+	for(i in 1:n){
+		for(j in 1:nrow(Switzerland)){
+		tmp[i,j] <- exp(sim1$sims.list$b0[ord[i]] +
+						sim1$sims.list$bForest[ord[i]]*Switzerland$forest[j] +
+						sim1$sims.list$bForest2[ord[i]]*Switzerland$forest[j]^2 +
+						sim1$sims.list$bElevation[ord[i]]*Switzerland$elevation[j] +
+						sim1$sims.list$bElevation2[ord[i]]*Switzerland$elevation[j]^2)
+		}
+	}
+) # 256 sec
+#save(tmp, file = "1000AbundanceLayers.RData")
+```
+
+```{r kmeans, warning = FALSE, message = FALSE}
+# Estimate optimal number of clusters 
+#load prediction
+load(file = "1000AbundanceLayers.RData")
+dim(tmp)
+
+#compare elevation and species abundance maps
+Switzerland$abundance <- colMeans(tmp)
+raster_abundance <- rasterFromXYZ(data.frame(x = Switzerland$x, y = Switzerland$y, z = Switzerland$abundance))
+par(mfrow = c(1, 2))
+plot(raster, col = mapPalette(100), main = "Elevation map")
+plot(raster_abundance, main = "Abundance map")
+par(mfrow = c(1, 1))
+
+#'identify' key areas  
+high_abundance <- Switzerland[Switzerland$abundance > 4.5,] # say, greater than or equal to this is considered high species abundance
+raster <- rasterFromXYZ(data.frame(x = Switzerland$x, y = Switzerland$y, z = Switzerland$elevation))
+plot(raster, col = mapPalette(100), main = "High abundance areas")
+points(high_abundance$x, high_abundance$y, pch = 16, cex = 1, col = adjustcolor("orange", 0.1)) 
+
+#calculate optimal number of clusters and centroids 
+#calculate k-means clusters
+system.time(
+	gap_stat <- clusGap(high_abundance, FUN = kmeans, nstart = 25, K.max = 10, B = 100, iter.max = 50)
+) # 85 s
+fviz_gap_stat(gap_stat)
+#calculate centroids
+A <- matrix(NA, nrow = length(high_abundance$x), ncol = 2)
+A[,1] <- high_abundance$x
+A[,2] <- high_abundance$y
+distance <- 119500	# adjust until n. centroids = optimal n. clusters
+chc <- hclust(dist(data.frame(x = high_abundance$x, y = high_abundance$y)), method = "complete")
+chcd <- cutree(chc, h = distance) 
+centroids <- aggregate(A, list(cluster = chcd), mean)
+pts <- cbind(x = centroids[,2], y = centroids[,3])
+plot(raster, col = mapPalette(100), main = "Location of centroids")
+points(high_abundance$x, high_abundance$y, pch = 16, cex = 1, col = adjustcolor("orange", 0.1)) 
+text(pts[,1], pts[,2], label = LETTERS[1:nrow(pts)], col = "green")
+```
+
+```{r analysis1, warning = FALSE, message = FALSE}
+# Aligning corridors on the map
+#align corridors with elevation information only
+plot(raster, col = mapPalette(100), main = "Corridors without wildlife information")
+raster2 <- rasterFromXYZ(data.frame(x = Switzerland$x,
+								   y = Switzerland$y,
+								   z = Switzerland$elevation))
+f <- function(x) max(x) - x[1] + x[2] 
+tr <- transition(raster2, transitionFunction = f, directions = 8)
+slope <- geoCorrection(tr, type = "c", multpl = FALSE, scl = FALSE)
+points(high_abundance$x, high_abundance$y, pch = 16, cex = 1, col = adjustcolor("orange", 0.1)) 
+for(j in 1:nrow(centroids)){
+	for(k in 1:nrow(centroids)){
+		plot(shortestPath(slope, pts[j,], pts[k,], output = "SpatialLines"),
+	  	     col = adjustcolor("cyan", 1), lwd = 1, add = TRUE)
+	}
+}
+text(pts[,1], pts[,2], label = LETTERS[1:nrow(pts)], col = "green")
+
+#align corridors with abundance estimate (only posterior mean)
+plot(raster, col = mapPalette(100), main = "Corridors with wildlife information (post. mean only)")
+raster3 <- rasterFromXYZ(data.frame(x = Switzerland$x,
+								   y = Switzerland$y,
+								   z = Switzerland$abundance))
+tr <- transition(raster3, transitionFunction = f, directions = 8)
+slope <- geoCorrection(tr, type = "c", multpl = FALSE, scl = FALSE)
+points(high_abundance$x, high_abundance$y, pch = 16, cex = 1, col = adjustcolor("orange", 0.1)) 
+for(j in 1:nrow(centroids)){
+	for(k in 1:nrow(centroids)){
+		plot(shortestPath(slope, pts[j,], pts[k,], output = "SpatialLines"),
+		     col = adjustcolor("cyan", 1), lwd = 1, add = TRUE)
+	}
+}
+text(pts[,1], pts[,2], label = LETTERS[1:nrow(pts)], col = "green")
+
+#align corridors with abundance estimates (posterior MCMC)
+plot(raster, col = mapPalette(100), main = "Corridors with wildlife information (post. mcmc)")
+points(high_abundance$x, high_abundance$y, pch = 16, cex = 1, col = adjustcolor("orange", 0.1)) 
+for(i in 1:n){
+	#stitch the pixels into a raster
+	raster4 <- rasterFromXYZ(data.frame(x = Switzerland$x, y = Switzerland$y, z = tmp[i,]))
+	#calculate paths connecting all centroids  
+	tr <- transition(raster4, transitionFunction = f, directions = 8)
+	slope <- geoCorrection(tr, type = "c", multpl = FALSE, scl = FALSE)
+	for(j in 1:nrow(centroids)){
+		for(k in 1:nrow(centroids)){
+			plot(shortestPath(slope, pts[j,], pts[k,], output = "SpatialLines"),
+			     col = adjustcolor("cyan", 0.01), lwd = 1, add = TRUE)
+		}
+	}
+}
+text(pts[,1], pts[,2], label = LETTERS[1:nrow(pts)], col = "green")
+```
+\
+
+## Notes
+
+- swath of lines
+
+When selecting proper alignment, corridor designers should examine a
+series of lines and evaluate the advantages and disadvantages of moving to
+the following cells rather than solely relying on the least-cost alignment.
+This is because a least-cost corridor could be surrounded by otherwise
+inappropriate habitats (e.g. human settlements) that are unlikely to be used and would be biologically
+irrelevant. By incorporating the Bayesian method into this Least-Cost-Path
+analysis, it gives not only the least-cost alignment (shown in magenta) but
+other alignments (shown in cyan) as well. The latter can serve as alternatives
+should any parts of the least-cost alignment cannot be used -- the more
+progressively vivid cyan indicating the more preferred alignment to choose
+from. 
+
+```{r difference, echo = FALSE, warning = FALSE, message = FALSE}
+# Combine post. mean and mcmc
+plot(raster, col = mapPalette(100), main = "Least-cost corridors and alternatives")
+points(high_abundance$x, high_abundance$y, pch = 16, cex = 1, col = adjustcolor("orange", 0.1)) 
+for(i in 1:n){
+	#stitch the pixels into a raster
+	raster4 <- rasterFromXYZ(data.frame(x = Switzerland$x, y = Switzerland$y, z = tmp[i,]))
+	#calculate paths connecting all centroids  
+	tr <- transition(raster4, transitionFunction = f, directions = 8)
+	slope <- geoCorrection(tr, type = "c", multpl = FALSE, scl = FALSE)
+	for(j in 1:nrow(centroids)){
+		for(k in 1:nrow(centroids)){
+			plot(shortestPath(slope, pts[j,], pts[k,], output = "SpatialLines"),
+				 col = adjustcolor("cyan", 0.01), lwd = 1, add = TRUE)
+		}
+	}
+}
+raster3 <- rasterFromXYZ(data.frame(x = Switzerland$x,
+								   y = Switzerland$y,
+								   z = Switzerland$abundance))
+tr <- transition(raster3, transitionFunction = f, directions = 8)
+slope <- geoCorrection(tr, type = "c", multpl = FALSE, scl = FALSE)
+for(j in 1:nrow(centroids)){
+	for(k in 1:nrow(centroids)){
+		plot(shortestPath(slope, pts[j,], pts[k,], output = "SpatialLines"),
+		     col = adjustcolor("magenta", 1), lwd = 2, add = TRUE)
+	}
+}
+text(pts[,1], pts[,2], label = LETTERS[1:nrow(pts)], col = "green")
+```
+
+- anthropogenic resistance
+
+Corridors often follow paths of least resistance based on the relationship
+between species movement and features such as terrain, land cover, or
+bioclimatic factors. Yet beyond the biophysical landscape, we also know that
+human activity can influence species movement. What has not
+considered in this analysis was the human activity context. Nevertheless,
+framing it as "anthropogenic resistance" is also possible in the modeling, and
+attributes such as human population densities and proximity from human
+infrastructures could be added to the resistance surface.
+
+```{r extras, eval = FALSE, include = FALSE, warning = FALSE, message = FALSE}
+tmp2 <- matrix(NA, nrow = 5, ncol = nrow(Switzerland))
+system.time(
+for(i in 1:5){
+	for(j in 1:nrow(Switzerland)){
+		tmp2[i,j] <- exp(sim1[[3+i]][[1]] +
+						 sim1[[3+i]][[2]]*Switzerland$forest[j] +
+						 sim1[[3+i]][[3]]*Switzerland$forest[j]^2 +
+						 sim1[[3+i]][[4]]*Switzerland$elevation[j] +
+						 sim1[[3+i]][[5]]*Switzerland$elevation[j]^2)
+	}
+}
+) # 1 sec
+
+plot(raster, col = mapPalette(100), main = "Important corridors and alternatives")
+for(i in 1:5){
+	raster5 <- rasterFromXYZ(data.frame(x = Switzerland$x,
+									   y = Switzerland$y,
+									   z = tmp2[i,]))
+	tr <- transition(raster5, transitionFunction = f, directions = 8)
+	slope <- geoCorrection(tr, type = "c", multpl = FALSE, scl = FALSE)
+	for(j in 1:nrow(centroids)){
+		for(k in 1:nrow(centroids)){
+			plot(shortestPath(slope, pts[j,], pts[k,], output = "SpatialLines"),
+				 col = adjustcolor("cyan", 1), lwd = 0.2, add = TRUE)
+		}
+	}
+}
+raster3 <- rasterFromXYZ(data.frame(x = Switzerland$x,
+								   y = Switzerland$y,
+								   z = Switzerland$abundance))
+tr <- transition(raster3, transitionFunction = f, directions = 8)
+slope <- geoCorrection(tr, type = "c", multpl = FALSE, scl = FALSE)
+for(j in 1:nrow(centroids)){
+	for(k in 1:nrow(centroids)){
+		plot(shortestPath(slope, pts[j,], pts[k,], output = "SpatialLines"),
+		     col = adjustcolor("magenta", 1), lwd = 2, add = TRUE)
+	}
+}
+text(pts[,1], pts[,2], label = LETTERS[1:nrow(pts)], col = "green")
+```
+
+
+ddd <- list()
+hhh <- list()
+for(i in 1:1000){
+	raster6 <- rasterFromXYZ(data.frame(x = Switzerland$x,
+										y = Switzerland$y,
+										z = tmp[i,]))
+	tr <- transition(raster6, transitionFunction = f, directions = 8)
+	slope <- geoCorrection(tr, type = "c", multpl = FALSE, scl = FALSE)
+	sss <- shortestPath(slope, c(920000, 60000), c(1250000, 140000), output = "SpatialLines")
+	ssss <- geom(sss)
+	ddd[[i]] <- ssss[,4:5]
+	fff <- pointDistance(ddd[[i]], lonlat = FALSE)
+	ggg <- numeric(nrow(fff)-1)
+	for(j in 1:(nrow(fff)-1)){
+		ggg[j] <- fff[1+j, j]
+	}
+	hhh[[i]] <- ggg
+}
+jjj <- sapply(hhh, sum)
+kkk <- max(jjj) - jjj
+plot(raster, col = mapPalette(100), main = "Important corridors and alternatives")
+colfunc <- colorRampPalette(c("white", "yellow", "orange", "red"))
+ranking <- rank(kkk, ties.method = "first")
+for(i in 1:length(kkk)){
+	idx <- which(ranking == i)
+	lines(ddd[[idx]], col = adjustcolor("red", 0.01)) #, col = colfunc(length(kkk))[i])
+}
+lines(ddd[[which.max(kkk)]], col = "green", lwd = 1)
+points(c(920000, 1250000), c(60000, 140000), pch = 16, cex = 1, col = "green")
